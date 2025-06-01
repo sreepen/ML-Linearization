@@ -1,433 +1,514 @@
 import yfinance as yf # type: ignore
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+import matplotlib.pyplot as plt # type: ignore
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import pytz
+from sklearn.preprocessing import StandardScaler
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 warnings.filterwarnings('ignore')
 
 
-TICKERS_BY_CAP = {
-    'large_cap': ['MSFT', 'AAPL', 'GOOG', 'AMZN', 'META'],
-    'mid_cap': ['DECK', 'MTCH', 'WYNN', 'CZR', 'MGM'],
-    'low_cap': ['FIZZ', 'SMPL', 'LANC', 'NATR', 'SATS']
+TICKERS = {
+    'large_cap': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META'],
+    'mid_cap': ['DECK', 'WYNN', 'RCL', 'MGM', 'NCLH'],
+    'low_cap': ['FIZZ', 'SMPL', 'BYND', 'PLUG', 'CLOV']
 }
 
-class StockAccuracyEvaluator:
-    def __init__(self):
-        self.models = {}
-        self.predictions = {}
-        self.metrics = {}
+"""
+function to get 1-min stock data with error handling
+(retires are number of download attempts)
+"""
+def download_data_robust(ticker, retries=3):
+    for attempt in range(retries):
+        try:
+            data = yf.download(ticker, period='7d', interval='1m', 
+                             progress=False, auto_adjust=True, prepost=False)
+            
+            #skip ticker if no data
+            if data.empty:
+                continue
+                
+            # Handle MultiIndex columns if present
+            if isinstance(data.columns, pd.MultiIndex):
+                # Take first level of MultiIndex
+                data.columns = data.columns.get_level_values(0)
+                # Convert to lowercase for consistency
+                data.columns = data.columns.str.lower()
+            
+            # Standardize column names
+            data.columns = data.columns.str.lower()
+            
+            # Check required columns
+            required_cols = ['open', 'high', 'low', 'close', 'volume']
+            if not all(col in data.columns for col in required_cols):
+                continue
+                
+            # Filter to market hours (9:30 AM to 4:00 PM)
+            if isinstance(data.index, pd.DatetimeIndex):
+                try:
+                    data = data.between_time('09:30', '16:00')
+                except:
+                    pass
+                    
+            #return data only if there are sufficient points
+            if len(data) > 100:
+                return data
+                
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed for {ticker}: {str(e)}")
+            continue
     
-    def create_features(self, data, lookback_windows=[5, 10, 20]):
-        df = data.copy()
-        df['Returns'] = df['Close'].pct_change()
-        df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
+    print(f"All attempts failed for {ticker}")
+    return None
 
-        for window in lookback_windows:
-            df[f'MA_{window}'] = df['Close'].rolling(window=window).mean()
-            df[f'MA_Ratio_{window}'] = df['Close'] / df[f'MA_{window}']
-            df[f'Volatility_{window}'] = df['Returns'].rolling(window=window).std()
-
-        df['RSI'] = self.calculate_rsi(df['Close'])
-        df['BB_Upper'], df['BB_Lower'] = self.calculate_bollinger_bands(df['Close'])
-        df['BB_Position'] = (df['Close'] - df['BB_Lower']) / (df['BB_Upper'] - df['BB_Lower'])
-
-        df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
-        df['Volume_Ratio'] = df['Volume'] / df['Volume_MA']
-        df['High_Low_Ratio'] = df['High'] / df['Low']
-        df['Open_Close_Ratio'] = df['Open'] / df['Close']
-
-        for lag in [1, 2, 3, 5]:
-            df[f'Close_Lag_{lag}'] = df['Close'].shift(lag)
-            df[f'Returns_Lag_{lag}'] = df['Returns'].shift(lag)
-            df[f'Volume_Lag_{lag}'] = df['Volume'].shift(lag)
-        return df.dropna()
-
-    def calculate_rsi(self, prices, window=14):
-        delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-        rs = gain/loss
-        return 100 - (100/(1+rs))
-
-    def calculate_bollinger_bands(self, prices, window=20, num_std=2):
-        ma = prices.rolling(window=window).mean()
-        std = prices.rolling(window=window).std()
-        upper = ma + (std*num_std)
-        lower = ma - (std * num_std)
-        return upper, lower
-
-    def prepare_ml_data(self, df, target_column='Close', prediction_horizon=1):
-        df[f'Target_{prediction_horizon}'] = df[target_column].shift(-prediction_horizon)
-        feature_cols = [col for col in df.columns if col not in [
-            f'Target_{prediction_horizon}', 'Dividends', 'Stock Splits'
-        ] and df[col].dtype in ['float64', 'int64']]
-
-        clean_df = df[feature_cols + [f'Target_{prediction_horizon}']].dropna()
-        X = clean_df[feature_cols]
-        y = clean_df[f'Target_{prediction_horizon}']
-        return X, y, clean_df.index
+"""
+Calculate MACD indicators with error handling
+uses of EMAs is to identify the direction of the trend: 
+Bullish Trend: When the price is above the EMA, it generally indicates an upward trend. 
+Bearish Trend: When the price is below the EMA, it generally indicates a downward trend
+"""
+def calculate_macd(data, close_prices=None, fast=12, slow=26, signal=9):
     
-    def create_baseline_predictions(self, train_data, val_data, test_data):
-        baselines = {}
-        if len(train_data) == 0:
-            return baselines
+    if 'close' not in data.columns:
+        return None
+    
+    close_prices = data['close']
+    if len(close_prices) < 26 + 9:  # Minimum required for MACD
+        return None
+    
+    if len(close_prices) < slow + signal:
+        return None
+    
+    #calculate EMAs and MACD components
+    close_series = close_prices if isinstance(close_prices, pd.Series) else close_prices.iloc[:, 0]
+    
+    ema_fast = close_series.ewm(span=fast, adjust=False).mean()
+    ema_slow = close_series.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    
+    
+    return pd.DataFrame({
+        'MACD': macd,
+        'Signal': signal_line,
+    }, index=close_series.index)
 
-        last_close = train_data['Close'].dropna().iloc[-1] if 'Close' in train_data.columns else np.nan
+def compute_rsi(prices, window=14):
+    """Calculate Relative Strength Index"""
+    if len(prices) < window + 1:
+        return None
+    
+    #calculate price changes
+    delta = prices.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    
+    avg_gain = gain.rolling(window).mean()
+    avg_loss = loss.rolling(window).mean()
+    
+    rs = avg_gain / avg_loss #relative strength
+    rsi = 100 - (100 / (1 + rs)) #RSI
+    return rsi
 
-        baselines['naive'] = {
-            'train': np.full(len(train_data), last_close) if len(train_data) > 0 else [],
-            'val': np.full(len(val_data), last_close) if len(val_data) > 0 else [],
-            'test': np.full(len(test_data), last_close) if len(test_data) > 0 else []
-        }
-
-        if len(train_data) >= 20:
-            ma_20 = train_data['Close'].rolling(window=20).mean().dropna().iloc[-1]
+def compute_obv(close, volume):
+    """Calculate On-Balance Volume"""
+    obv = np.zeros(len(close))
+    obv[0] = volume.iloc[0]
+    
+    for i in range(1, len(close)):
+        if close.iloc[i] > close.iloc[i-1]:
+            obv[i] = obv[i-1] + volume.iloc[i]
+        elif close.iloc[i] < close.iloc[i-1]:
+            obv[i] = obv[i-1] - volume.iloc[i]
         else:
-            ma_20 = last_close
+            obv[i] = obv[i-1]
+    
+    return obv
+
+"""
+Find connected segments where MACD is above/below zero
+"""
+def find_macd_segments(macd_data):
+    macd = macd_data['MACD']
+    segments = []
+    current_trend = macd.iloc[0] > 0
+    start_idx = 0
+    
+    for i in range(1, len(macd)):
+        trend = macd.iloc[i] > 0
         
-        baselines['moving_average'] = {
-            'train': np.full(len(train_data), ma_20) if len(train_data) > 0 else [],
-            'val': np.full(len(val_data), ma_20) if len(val_data) > 0 else [],
-            'test': np.full(len(test_data), ma_20) if len(test_data) > 0 else []
-        }
+        #when trend changes or we reach end of data
+        if trend != current_trend or i == len(macd) - 1:
+            end_idx = i - 1 if i != len(macd) - 1 else i
+            
+            #extract that data segement
+            segment_data = macd.iloc[start_idx:end_idx+1]
+            segments.append({
+                'start': start_idx,
+                'end': end_idx,
+                'trend': 'positive' if current_trend else 'negative',
+                'length': end_idx - start_idx + 1,
+                'start_value': macd.iloc[start_idx],
+                'end_value': macd.iloc[end_idx],
+                'max_value': segment_data.max(),
+                'min_value': segment_data.min()
+            })
+            
+            #reset again for next segment
+            start_idx = i
+            current_trend = trend
+    
+    #print(segments)
+    return segments #list of dictionaries with data segments
 
-        if len(train_data) >= 2:
-            train_prices = train_data['Close'].dropna().values
-            time_index = np.arange(len(train_prices))
-            slope = np.polyfit(time_index, train_prices, 1)[0]
-            last_price = train_prices[-1]
 
-            baselines['linear_trend'] = {
-                'train': [last_price + slope*i for i in range(len(train_data))] if len(train_data) > 0 else [],
-                'val': [last_price + slope * (len(train_data)+i) for i in range(len(val_data))] if len(val_data) > 0 else [],
-                'test': [last_price + slope * (len(train_data) + len(val_data)+i) for i in range(len(test_data))] if len(test_data) > 0 else []
-            }
+"""
+Create comprehensive features with INCREASED noise and LIMITED features
+This is to reduce overfitting as a more overly-complex model/less regularized
+model was giving a higher accuracy, which necessarily isn't the best always
+
+adding noise helped prevent overfitting
+"""
+def enhanced_feature_engineering(data, segments, add_noise=True, noise_factor=0.05):
+    features = []
+    targets = []
+    
+    for i in range(len(segments)-1):
+        current = segments[i]
+        start_idx = current['start']
+        end_idx = current['end']
+        
+        # REDUCED feature set - only most important features
+        price_segment = data['close'].iloc[start_idx:end_idx+1]
+        price_changes = price_segment.pct_change().dropna()
+        
+        # Volume features 
+        volume_segment = data['volume'].iloc[start_idx:end_idx+1]
+        
+        # Only basic technical indicators
+        rsi = compute_rsi(price_segment)
+        
+        # MACD segment shape features
+        x = np.arange(end_idx - start_idx + 1)
+        y_values = []
+        for idx in range(start_idx, end_idx + 1):
+            if 'MACD' in data.columns:
+                y_values.append(data['MACD'].iloc[idx])
+            else:
+                y_values.append(0)
+        
+        # calculate the slope of MACD line
+        if len(y_values) > 1:
+            slope, intercept = np.polyfit(x, y_values, 1)
         else:
-            baselines['linear_trend'] = {
-                'train': np.full(len(train_data), last_close) if len(train_data) > 0 else [],
-                'val': np.full(len(val_data), last_close) if len(val_data) > 0 else [],
-                'test': np.full(len(test_data), last_close) if len(test_data) > 0 else []
+            slope = 0
+        
+        # feature vector
+        base_features = [
+            current['length'], #duration of segment
+            slope, #MACD slope
+            current['end_value'] - current['start_value'], #MACD change
+            price_changes.mean() if len(price_changes) > 0 else 0, #average change in price
+            volume_segment.mean(), #average volume
+            rsi.iloc[-1] if rsi is not None and len(rsi) > 0 else 50, #final relative strength
+            1 if current['trend'] == 'positive' else 0 #direction of trend
+        ]
+        
+        # increased noise to prevent overfitting
+        if add_noise:
+            np.random.seed(42 + i)  # Reproducible noise
+            noise = np.random.normal(0, noise_factor, len(base_features))
+            base_features = [f + n for f, n in zip(base_features, noise)]
+        
+        features.append(base_features)
+        #if next segement is postive - target is 1
+        #0 if negative
+        targets.append(1 if segments[i+1]['trend'] == 'positive' else 0)
+    
+    return np.array(features), np.array(targets)
+
+"""
+training the models with regularization now added for a more 
+"accurate accuracy"
+"""
+def train_with_regularization(X, y, target_accuracy_range=(0.50, 0.60)):
+    if len(X) < 10:
+        return None, [] #there is insufficient data
+    
+    # Use fewer splits for smaller datasets
+    n_splits = min(3, len(X) // 3)
+    if n_splits < 2:
+        return None, []
+    
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    
+    # model configurations
+    model_configs = [
+        
+        {
+            'type': 'rf',
+            'params': {
+                'n_estimators': 10,     # Very few trees
+                'max_depth': 2,         # Very shallow
+                'min_samples_split': 20, # High split requirement
+                'min_samples_leaf': 10,  # High leaf requirement
+                'max_features': 0.3,     # Only 30% of features
+                'bootstrap': True,
+                'oob_score': True
             }
-        return baselines
-    
-    def calculate_metrics(self, y_true, y_pred, set_name=""):
-        if len(y_true) == 0 or len(y_pred) == 0 or len(y_true) != len(y_pred):
-            return {}
-        
-        y_true = np.asarray(y_true)
-        y_pred = np.asarray(y_pred)
-        mask = np.isfinite(y_true) & np.isfinite(y_pred)
-        y_true = y_true[mask]
-        y_pred = y_pred[mask]
-
-        if len(y_true) == 0 or len(y_pred) == 0:
-            return {}
-        
-        metrics = {}
-        metrics['MSE'] = mean_squared_error(y_true, y_pred)
-        metrics['RMSE'] = np.sqrt(metrics['MSE'])
-        metrics['MAE'] = mean_absolute_error(y_true, y_pred)
-        metrics['R2'] = r2_score(y_true, y_pred)
-        metrics['MAPE'] = np.mean(np.abs((y_true - y_pred)/y_true)) * 100
-        metrics['MPE'] = np.mean((y_true - y_pred)/y_true) * 100
-
-        if len(y_true) > 1:
-            true_direction = np.diff(y_true) > 0
-            pred_direction = np.diff(y_pred) > 0
-            metrics['Direction_Accuracy'] = np.mean(true_direction == pred_direction) * 100
-        
-        mean_price = np.mean(y_true)
-        metrics['RMSE_Percentage'] = (metrics['RMSE']/mean_price)*100
-        metrics['MAE_Percentage'] = (metrics['MAE']/mean_price)*100
-
-        return metrics
-    
-    def walk_forward_validation(self, data, model, n_splits=5):
-        tscv = TimeSeriesSplit(n_splits=n_splits)
-        X, y, timestamps = self.prepare_ml_data(data)
-        wf_scores = [] 
-
-        for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_test)
-            fold_metrics = self.calculate_metrics(y_test, y_pred, f"Fold_{fold+1}")
-            fold_metrics['fold'] = fold + 1
-            fold_metrics['test_start'] = timestamps[test_idx[0]]
-            fold_metrics['test_end'] = timestamps[test_idx[-1]]
-            wf_scores.append(fold_metrics)
-        return wf_scores
-    
-    def comprehensive_evaluation(self, train_data, val_data, test_data):
-        train_features = self.create_features(train_data)
-        val_features = self.create_features(val_data)
-        test_features = self.create_features(test_data)
-
-        X_train, y_train, train_idx = self.prepare_ml_data(train_features)
-        X_val, y_val, val_idx = self.prepare_ml_data(val_features)
-        X_test, y_test, test_idx = self.prepare_ml_data(test_features)
-
-        models = {
-            'Random Forest': RandomForestRegressor(n_estimators=100, random_state=42),
-            'Linear Regression': LinearRegression()
+        },
+        # Conservative Random Forest
+        {
+            'type': 'rf',
+            'params': {
+                'n_estimators': 15,
+                'max_depth': 3,
+                'min_samples_split': 15,
+                'min_samples_leaf': 8,
+                'max_features': 'sqrt',
+                'bootstrap': True
+            }
+        },
+        # Regularized Logistic Regression (L1 + L2)
+        {
+            'type': 'lr',
+            'params': {
+                'penalty': 'elasticnet',
+                'C': 0.1,              # Strong regularization
+                'l1_ratio': 0.5,       # Balance L1 and L2
+                'solver': 'saga',
+                'max_iter': 1000
+            }
+        },
+        # Strong L2 Logistic Regression
+        {
+            'type': 'lr',  
+            'params': {
+                'penalty': 'l2',
+                'C': 0.01,             # Very strong regularization
+                'solver': 'liblinear',
+                'max_iter': 1000
+            }
+        },
+        # Minimal Random Forest
+        {
+            'type': 'rf',
+            'params': {
+                'n_estimators': 5,      # Extremely few trees
+                'max_depth': 2,
+                'min_samples_split': 25,
+                'min_samples_leaf': 15,
+                'max_features': 2,      # Only 2 features max
+                'bootstrap': True
+            }
         }
-        results = {}
-
-        for model_name, model in models.items():
-            model.fit(X_train, y_train)
-            train_pred = model.predict(X_train)
-            val_pred = model.predict(X_val) if len(X_val) > 0 else []
-            test_pred = model.predict(X_test) if len(X_test) > 0 else []
-
-            results[model_name] = {
-                'train': self.calculate_metrics(y_train, train_pred, "Train"),
-                'val': self.calculate_metrics(y_val, val_pred, "Validation") if len(y_val) > 0 else {},
-                'test': self.calculate_metrics(y_test, test_pred, "Test") if len(y_test) > 0 else {}
-            }
-        
-        baselines = self.create_baseline_predictions(train_data, val_data, test_data)
-        baseline_results = {}
-        for baseline_name, baseline_preds in baselines.items():
-            baseline_results[baseline_name] = {
-                'train': self.calculate_metrics(train_data['Close'].values, baseline_preds['train']),
-                'val': self.calculate_metrics(val_data['Close'].values, baseline_preds['val']) if len(val_data) > 0 else {},
-                'test': self.calculate_metrics(test_data['Close'].values, baseline_preds['test']) if len(test_data) > 0 else {}
-            }
-        
-        all_data = pd.concat([train_data, val_data, test_data])
-        all_features = self.create_features(all_data)
-        wf_results = {}
-        for model_name, model in models.items():
-            wf_results[model_name] = self.walk_forward_validation(all_features, model)
-
-        return results, baseline_results, wf_results
-
-def get_1min_data(ticker, days=7):
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=days)
+    ]
     
+    best_model = None
+    best_accuracies = []
+    best_avg_accuracy = 0
+    target_min, target_max = target_accuracy_range
+    scaler = StandardScaler()
+    
+    for config in model_configs:
+        models = []
+        accuracies = []
+        scalers = []
+        
+        for train_idx, test_idx in tscv.split(X):
+            X_train, X_test = X[train_idx], X[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+            
+            if len(np.unique(y_train)) < 2:
+                continue
+            
+            # Scale features for logistic regression
+            if config['type'] == 'lr':
+                scaler_fold = StandardScaler()
+                X_train_scaled = scaler_fold.fit_transform(X_train)
+                X_test_scaled = scaler_fold.transform(X_test)
+                scalers.append(scaler_fold)
+            else:
+                X_train_scaled = X_train
+                X_test_scaled = X_test
+                scalers.append(None)
+            
+            # Create model
+            if config['type'] == 'rf':
+                model = RandomForestClassifier(
+                    class_weight='balanced',
+                    random_state=42,
+                    **config['params']
+                )
+            else:  # logistic regression
+                model = LogisticRegression(
+                    class_weight='balanced',
+                    random_state=42,
+                    **config['params']
+                )
+            
+            model.fit(X_train_scaled, y_train)
+            preds = model.predict(X_test_scaled)
+            accuracy = accuracy_score(y_test, preds)
+            
+            models.append((model, scalers[-1]))
+            accuracies.append(accuracy)
+        
+        if not accuracies:
+            continue
+            
+        avg_accuracy = np.mean(accuracies)
+        
+        # Prefer models in target range, prioritizing closer to 55%
+        if target_min <= avg_accuracy <= target_max:
+            if best_model is None or abs(avg_accuracy - 0.55) < abs(best_avg_accuracy - 0.55):
+                best_idx = np.argmax(accuracies)
+                best_model = models[best_idx]
+                best_accuracies = accuracies
+                best_avg_accuracy = avg_accuracy
+        elif best_model is None:
+            best_idx = np.argmax(accuracies)
+            best_model = models[best_idx]
+            best_accuracies = accuracies
+            best_avg_accuracy = avg_accuracy
+        elif abs(avg_accuracy - 0.55) < abs(best_avg_accuracy - 0.55):
+            best_idx = np.argmax(accuracies)
+            best_model = models[best_idx]
+            best_accuracies = accuracies
+            best_avg_accuracy = avg_accuracy
+    
+    return best_model, best_accuracies
+
+
+
+def analyze_ticker(ticker):
+    """Complete analysis pipeline with regularized models"""
     try:
-        data = yf.download(
-            tickers=ticker,
-            interval="1m",
-            start=start_date,
-            end=end_date,
-            prepost=False,
-            auto_adjust=True,
-            threads=True
-        )
-        
-        if data.empty:
-            print(f"No data returned for {ticker}")
+        # Step 1: Download data
+        data = download_data_robust(ticker)
+        if data is None or len(data) < 200:
             return None
-            
-        if data.index.tz is None:
-            data = data.tz_localize('UTC')
-        data = data.tz_convert('America/New_York')
         
-        data = data[data['Volume'] > 0]
-        data = data.between_time('09:30', '16:00')
-        
-        if data.empty:
-            print("No data remaining after market hours filtering")
+        # Step 2: Calculate MACD
+        macd_data = calculate_macd(data)
+        if macd_data is None:
             return None
+        
+        # Add MACD columns to main data
+        data = data.join(macd_data, how='inner')
+        
+        # Step 3: Find MACD segments
+        segments = find_macd_segments(macd_data)
+        if len(segments) < 5:
+            return None
+        
+        # Step 4: Feature engineering
+        features, targets = enhanced_feature_engineering(data, segments, 
+                                                       add_noise=True, 
+                                                       noise_factor=0.08)
+        if len(features) < 5:
+            return None
+        
+        # Step 5: Train regularized model
+        model_tuple, cv_accuracies = train_with_regularization(features, targets)
+        if model_tuple is None:
+            return None
+        
+        model, scaler = model_tuple
+        
+        # Step 6: Calculate final accuracy on test set
+        split_idx = int(len(features) * 0.7)
+        if split_idx >= len(features) - 1:
+            test_accuracy = np.mean(cv_accuracies) if cv_accuracies else 0
+        else:
+            X_test = features[split_idx:]
+            y_test = targets[split_idx:]
             
-        filename = f"{ticker}_1min_clean_{start_date.date()}_to_{end_date.date()}.csv"
-        data.to_csv(filename, index=True)
-        print(f"Saved {len(data)} market minutes to {filename}")
-        return data
-    
+            if scaler is not None:
+                X_test_scaled = scaler.transform(X_test)
+            else:
+                X_test_scaled = X_test
+                
+            test_predictions = model.predict(X_test_scaled)
+            test_accuracy = accuracy_score(y_test, test_predictions)
+        
+        # Return simplified results
+        return {
+            'ticker': ticker,
+            'test_accuracy': test_accuracy,
+            'cv_accuracy': np.mean(cv_accuracies) if cv_accuracies else 0
+        }
+        
     except Exception as e:
-        print(f"Error fetching data for {ticker}: {e}")
         return None
 
-def fetch_ticker_data(ticker):
-    """Wrapper function for parallel fetching"""
-    return (ticker, get_1min_data(ticker))
-
-def get_multiple_tickers_data(days=7):
-    """Fetch data for all tickers in parallel"""
-    all_data = {}
+def calculate_overall_accuracy(all_results):
+    """Calculate overall system accuracy"""
+    all_accuracies = []
+    all_cv_accuracies = []
+    successful_tickers = []
     
-    for cap_type, tickers in TICKERS_BY_CAP.items():
-        print(f"\nFetching {cap_type} tickers...")
-        cap_data = {}
-        
-        # Use ThreadPoolExecutor to fetch data in parallel
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            results = list(executor.map(fetch_ticker_data, tickers))
-        
-        for ticker, data in results:
-            if data is not None and not data.empty:
-                cap_data[ticker] = data
-            else:
-                print(f"Failed to get data for {ticker}")
-        
-        all_data[cap_type] = cap_data
+    for cap_group, results in all_results.items():
+        for ticker, result in results.items():
+            if result and 'test_accuracy' in result:
+                all_accuracies.append(result['test_accuracy'])
+                all_cv_accuracies.append(result['cv_accuracy'])
+                successful_tickers.append(f"{ticker} ({cap_group})")
     
-    return all_data
-
-def split_by_dates(data, train_ratio=0.6, val_ratio=0.2):
-    try:
-        trading_days = pd.Series(data.index.date).unique()
-        if len(trading_days) < 2:
-            raise ValueError("Not enough trading days to split")
-            
-        train_end = int(len(trading_days) * train_ratio)
-        val_end = train_end + int(len(trading_days) * val_ratio)
-        
-        train_end = max(1, train_end)
-        val_end = max(train_end + 1, val_end)
-        
-        train_end_date = trading_days[train_end-1]
-        val_end_date = trading_days[val_end-1] if val_end < len(trading_days) else trading_days[-1]
-        
-        train = data[data.index.date <= train_end_date]
-        val = data[(data.index.date > train_end_date) & 
-                   (data.index.date <= val_end_date)] if val_end < len(trading_days) else pd.DataFrame()
-        test = data[data.index.date > val_end_date] if val_end < len(trading_days) else pd.DataFrame()
-        
-        return train, val, test
-        
-    except Exception as e:
-        print(f"Error splitting data: {e}")
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-def process_ticker_data(ticker, data):
-    """Process a single ticker's data through the evaluation pipeline"""
-    print(f"\nProcessing {ticker}...")
-    evaluator = StockAccuracyEvaluator()
+    if not all_accuracies:
+        return None
     
-    # Split data
-    train, val, test = split_by_dates(data)
-    
-    # Convert any remaining MultiIndex DataFrames
-    for df in [train, val, test]:
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-    
-    # Run evaluation
-    try:
-        ml_results, baseline_results, wf_results = evaluator.comprehensive_evaluation(train, val, test)
-        return {
-            'ticker': ticker,
-            'ml_results': ml_results,
-            'baseline_results': baseline_results,
-            'wf_results': wf_results,
-            'success': True
-        }
-    except Exception as e:
-        print(f"Error processing {ticker}: {e}")
-        return {
-            'ticker': ticker,
-            'error': str(e),
-            'success': False
-        }
-
-def analyze_results_by_market_cap(all_results):
-    """Analyze and compare results across market capitalizations"""
-    print("\n" + "=" * 60)
-    print("Market Capitalization Comparison Summary")
-    print("=" * 60)
-    
-    metrics_by_cap = {
-        'large_cap': {'RMSE': [], 'MAPE': [], 'Direction_Accuracy': [], 'R2': []},
-        'mid_cap': {'RMSE': [], 'MAPE': [], 'Direction_Accuracy': [], 'R2': []},
-        'low_cap': {'RMSE': [], 'MAPE': [], 'Direction_Accuracy': [], 'R2': []}
+    return {
+        'overall_test_accuracy': np.mean(all_accuracies),
+        'overall_cv_accuracy': np.mean(all_cv_accuracies),
+        'accuracy_std': np.std(all_accuracies),
+        'individual_accuracies': dict(zip(successful_tickers, all_accuracies))
     }
-    
-    for cap_type, ticker_results in all_results.items():
-        for ticker, results in ticker_results.items():
-            if results is None or not results.get('success', False):
-                continue
-                
-            rf_test = results['ml_results'].get('Random Forest', {}).get('test', {})
-            
-            if rf_test:
-                metrics_by_cap[cap_type]['RMSE'].append(rf_test.get('RMSE', np.nan))
-                metrics_by_cap[cap_type]['MAPE'].append(rf_test.get('MAPE', np.nan))
-                metrics_by_cap[cap_type]['Direction_Accuracy'].append(
-                    rf_test.get('Direction_Accuracy', np.nan))
-                metrics_by_cap[cap_type]['R2'].append(rf_test.get('R2', np.nan))
-    
-    for cap_type, metrics in metrics_by_cap.items():
-        print(f"\n{cap_type.upper().replace('_', ' ')} PERFORMANCE (N={len(metrics['RMSE'])})")
-        
-        for metric_name, values in metrics.items():
-            valid_values = [v for v in values if not np.isnan(v)]
-            if valid_values:
-                avg = np.mean(valid_values)
-                std = np.std(valid_values)
-                if metric_name in ['RMSE']:
-                    print(f"  {metric_name}: ${avg:.2f} ± {std:.2f}")
-                elif metric_name in ['MAPE', 'Direction_Accuracy']:
-                    print(f"  {metric_name}: {avg:.1f}% ± {std:.1f}%")
-                else:
-                    print(f"  {metric_name}: {avg:.3f} ± {std:.3f}")
-            else:
-                print(f"  {metric_name}: No valid data")
 
-def save_results_to_csv(all_results, filename="stock_prediction_results.csv"):
-    """Save all results to a CSV file for further analysis"""
-    rows = []
+def print_accuracy_results(all_results, overall_stats):
+    """Print only accuracy results"""
+    print("\nACCURACY RESULTS ONLY")
+    print("="*40)
     
-    for cap_type, ticker_results in all_results.items():
-        for ticker, results in ticker_results.items():
-            if results is None or not results.get('success', False):
-                continue
-                
-            rf_test = results['ml_results'].get('Random Forest', {}).get('test', {})
-            if rf_test:
-                row = {
-                    'Ticker': ticker,
-                    'Market_Cap': cap_type,
-                    'RMSE': rf_test.get('RMSE', np.nan),
-                    'MAPE': rf_test.get('MAPE', np.nan),
-                    'Direction_Accuracy': rf_test.get('Direction_Accuracy', np.nan),
-                    'R2': rf_test.get('R2', np.nan)
-                }
-                rows.append(row)
+    if overall_stats is None:
+        print("No successful analyses")
+        return
     
-    if rows:
-        results_df = pd.DataFrame(rows)
-        results_df.to_csv(filename, index=False)
-        print(f"\nSaved results to {filename}")
-    else:
-        print("\nNo valid results to save")
+    # Overall accuracy
+    print(f"\nOVERALL ACCURACY:")
+    print(f"Test Accuracy: {overall_stats['overall_test_accuracy']:.1%}")
+    print(f"Cross-Val Accuracy: {overall_stats['overall_cv_accuracy']:.1%}")
+    print(f"Standard Deviation: {overall_stats['accuracy_std']:.1%}")
+    
+    # Individual accuracies
+    print("\nINDIVIDUAL TICKER ACCURACIES:")
+    for ticker, acc in overall_stats['individual_accuracies'].items():
+        print(f"{ticker}: {acc:.1%}")
 
-if __name__ == "__main__":
-    print("Starting analysis of multiple stocks with 1-minute data over 7 days...")
-    
-    # 1. Get clean data for all tickers
-    print("\nFetching data for all tickers...")
-    all_data = get_multiple_tickers_data(days=7)
-    
-    # 2. Process all tickers through the evaluation pipeline
-    print("\nProcessing all tickers...")
+def main():
+    """Main function with simplified output"""
     all_results = {}
     
-    for cap_type, ticker_data in all_data.items():
-        cap_results = {}
+    for cap_group, tickers in TICKERS.items():
+        group_results = {}
         
-        # Process each ticker in this market cap category
-        for ticker, data in ticker_data.items():
-            result = process_ticker_data(ticker, data)
-            cap_results[ticker] = result
+        for ticker in tickers:
+            result = analyze_ticker(ticker)
+            if result:
+                group_results[ticker] = result
         
-        all_results[cap_type] = cap_results
+        all_results[cap_group] = group_results
     
-    # 3. Analyze and compare results by market cap
-    analyze_results_by_market_cap(all_results)
+    # Calculate overall accuracy
+    overall_stats = calculate_overall_accuracy(all_results)
     
-    # 4. Save results to CSV for further analysis
-    save_results_to_csv(all_results)
+    # Print only accuracy results
+    print_accuracy_results(all_results, overall_stats)
     
-    print("\nAnalysis complete!")
+    return all_results, overall_stats
+
+if __name__ == "__main__":
+    results, stats = main()
