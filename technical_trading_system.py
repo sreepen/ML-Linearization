@@ -368,15 +368,18 @@ class TechnicalTradingSystem:
             backtest = self.backtest_strategy(signals, initial_capital)
 
             results.append({
-                'ticker': ticker,
-                'time_window': f"{start_time}-{end_time}",
-                'strategy_return': backtest['return_percentage'],
-                'buy_hold_return': backtest['buy_hold_return'],
-                'alpha': backtest['return_percentage'] - backtest['buy_hold_return'],
-                'total_trades': backtest['total_trades'],
-                'win_rate': backtest['win_rate'],
-                'max_drawdown': backtest['max_drawdown']
-            })
+            'ticker': ticker,
+            'time_window': f"{start_time}-{end_time}",
+            'strategy_return': backtest['return_percentage'],
+            'buy_hold_return': backtest['buy_hold_return'],
+            'alpha': backtest['return_percentage'] - backtest['buy_hold_return'],
+            'total_trades': backtest['total_trades'],
+            'win_rate': backtest['win_rate'],
+            'max_drawdown': backtest['max_drawdown'],
+            'final_capital': backtest['final_capital'],  # Add this line
+            'profit_loss': backtest['final_capital'] - initial_capital,  # Add this line
+            'buy_hold_value': initial_capital * (1 + backtest['buy_hold_return']/100)  # Add this line
+        })
         
         return pd.DataFrame(results)
 
@@ -386,7 +389,7 @@ def analyze_time_intervals():
     print("=" * 80)
     print("Testing different trading windows to find optimal times")
 
-    #Define time windows to test
+    # Define time windows to test
     time_windows = [
         ('06:30', '16:00'), #early pre-market to close
         ('07:00', '16:00'), #mind pre-market to close
@@ -399,7 +402,7 @@ def analyze_time_intervals():
         ('12:00', '16:00')   # Afternoon session only
     ]
 
-    #initialize trading system
+    # Initialize trading system
     system = TechnicalTradingSystem(
         macd_fast=12,
         macd_slow=26,
@@ -410,14 +413,15 @@ def analyze_time_intervals():
         trailing_stop_pct=0.05
     )
 
-        # Test on a sample of tickers
-    test_tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'DECK', 'WYNN', 'RCL', 'MGM', 'NCLH']
+    # Test on a sample of tickers
+    test_tickers = ['TSLA', 'NVDA', 'AMD', 'META', 'AAPL', 'AMZN', 'GOOGL', 'MSFT', 'COIN', 'MARA']
+    initial_capital = 10000
     
     all_results = []
     
     for ticker in test_tickers:
         print(f"\nAnalyzing {ticker} across time windows...")
-        results = system.backtest_time_windows(ticker, time_windows)
+        results = system.backtest_time_windows(ticker, time_windows, initial_capital)
         if not results.empty:
             all_results.append(results)
     
@@ -433,7 +437,9 @@ def analyze_time_intervals():
         'strategy_return': 'mean',
         'buy_hold_return': 'mean',
         'win_rate': 'mean',
-        'total_trades': 'mean'
+        'total_trades': 'mean',
+        'profit_loss': 'mean',  # Add this line
+        'final_capital': 'mean'  # Add this line
     }).sort_values('alpha', ascending=False)
     
     print("\nTIME WINDOW PERFORMANCE SUMMARY")
@@ -443,25 +449,34 @@ def analyze_time_intervals():
     # Find best performing window
     best_window = summary.iloc[0].name
     avg_alpha = summary.iloc[0]['alpha']
+    avg_profit = summary.iloc[0]['profit_loss']
     
-    print(f"\nBEST PERFORMING TIME WINDOW: {best_window} (Avg Alpha: {avg_alpha:.2f}%)")
+    print(f"\nBEST PERFORMING TIME WINDOW: {best_window}")
+    print(f"  Average Alpha: {avg_alpha:.2f}%")
+    print(f"  Average Profit: ${avg_profit:.2f} (Starting with ${initial_capital})")
     
-    # Additional analysis
+    # Additional analysis with monetary values
     early_windows = [w for w in time_windows if w[0] <= '08:00']
     early_results = combined_results[combined_results['time_window'].isin([f"{s}-{e}" for s,e in early_windows])]
     
     if not early_results.empty:
         early_alpha = early_results['alpha'].mean()
+        early_profit = early_results['profit_loss'].mean()
         print(f"\nEARLY MORNING SESSIONS (6:30-8:00 start):")
         print(f"  Average Alpha: {early_alpha:.2f}%")
+        print(f"  Average Profit: ${early_profit:.2f}")
         print(f"  Average Win Rate: {early_results['win_rate'].mean():.1%}")
         print(f"  Average Trades: {early_results['total_trades'].mean():.1f}")
     
-    print("\nRECOMMENDATIONS:")
-    print("1. Early morning sessions often show different volatility patterns")
-    print("2. Pre-market moves can sometimes predict regular session trends")
-    print("3. Liquidity is lower in pre-market, affecting execution")
-    print("4. The optimal window depends on your strategy and risk tolerance")
+    print("\nDETAILED MONETARY RESULTS BY TIME WINDOW:")
+    print("-" * 80)
+    print(f"{'Time Window':<15}{'Avg Strategy':<15}{'Avg Buy&Hold':<15}{'Avg Profit':<15}{'Avg Final Capital':<20}")
+    for idx, row in summary.iterrows():
+        print(f"{idx:<15}{row['strategy_return']:+.2f}%{'':<8}{row['buy_hold_return']:+.2f}%{'':<8}"
+              f"${row['profit_loss']:+.2f}{'':<8}${row['final_capital']:.2f}")
+    
+
+    print(f"5. The most profitable window was {best_window} with average profit of ${avg_profit:.2f}")
 
 def analyze_ticker_technical(ticker, system):
     """Analyze a single ticker using technical trading system"""
