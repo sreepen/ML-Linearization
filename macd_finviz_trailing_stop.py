@@ -17,7 +17,7 @@ import seaborn as sns # type: ignore
 warnings.filterwarnings('ignore')
 
 # FinViz Configuration
-FINVIZ_AUTH = "697f91ea-b318-4835-8ca3-86ec9ba5452a"
+FINVIZ_AUTH = "092c188a-3f33-4422-943d-db8acda1dd8a"
 REQUEST_DELAY = 2
 
 # Dictionary of tickers categorized by market capitalization
@@ -200,11 +200,15 @@ class TrailingStopLoss:
         self.highest_price = None
         self.entry_price = None
         self.atr_multiplier = 2.0  # For ATR-based trailing stop
+        self.max_price_reached = False  # Track if we've reached a new max
+        self.max_price = None  # Track the maximum price reached
     
     def initialize(self, entry_price, current_high=None, atr_value=None):
         """Initialize the trailing stop when entering a position"""
         self.entry_price = entry_price
         self.highest_price = current_high if current_high else entry_price
+        self.max_price = entry_price  # Initialize max price
+        self.max_price_reached = False
         
         if self.strategy == 'percentage':
             self.stop_price = entry_price * (1 - self.trail_percent / 100)
@@ -221,13 +225,25 @@ class TrailingStopLoss:
         Update the trailing stop price
         
         Returns:
-            tuple: (should_exit, new_stop_price)
+            tuple: (should_exit, new_stop_price, message)
         """
         if self.stop_price is None or self.highest_price is None:
-            return False, None
+            return False, None, None
+        
+        message = None
+        price_to_use = current_high if current_high else current_price
+        
+        # Check if we've reached a new maximum price
+        if price_to_use > self.max_price:
+            self.max_price = price_to_use
+            self.max_price_reached = True
+            
+            # Calculate allowed loss from max price
+            if self.max_price_reached:
+                allowed_loss_pct = (1 - (self.stop_price / self.max_price)) * 100
+                message = f"You are only allowed to lose {allowed_loss_pct:.2f}% from the max price of {self.max_price:.2f}"
         
         # Update highest price seen
-        price_to_use = current_high if current_high else current_price
         if price_to_use > self.highest_price:
             self.highest_price = price_to_use
             
@@ -249,13 +265,15 @@ class TrailingStopLoss:
         # Check if we should exit (current price hit the stop)
         should_exit = current_price <= self.stop_price
         
-        return should_exit, self.stop_price
+        return should_exit, self.stop_price, message
     
     def reset(self):
         """Reset the trailing stop for a new position"""
         self.stop_price = None
         self.highest_price = None
         self.entry_price = None
+        self.max_price = None
+        self.max_price_reached = False
 
 class TimeIntervalTracker:
     """Track profits across different time intervals"""
@@ -340,11 +358,13 @@ class TimeIntervalTracker:
 
 class MACDPredictionMethod:
     def __init__(self, fast=12, slow=26, signal=9, forecast_window=2, 
-                 use_trailing_stop=True, trail_percent=5.0, trail_strategy='percentage'):
+                 use_trailing_stop=True, trail_percent=5.0, trail_strategy='percentage',
+                 interval='1h'):
         self.fast = fast
         self.slow = slow
         self.signal = signal
         self.forecast_window = forecast_window
+        self.interval = interval  # Store the interval
         self.interval_tracker = TimeIntervalTracker()
         
         # Trailing stop loss configuration
@@ -409,8 +429,7 @@ class MACDPredictionMethod:
         
         return features.dropna()
 
-    def simulate_trading_with_trailing_stop(self, features, predictions, initial_capital=10000, 
-                                          transaction_cost=0.001):
+    def simulate_trading_with_trailing_stop(self, features, predictions, initial_capital=10000, transaction_cost=0.001):
         """Enhanced trading simulation with trailing stop loss"""
         capital = initial_capital
         shares = 0
@@ -453,11 +472,16 @@ class MACDPredictionMethod:
             # Check trailing stop if in position
             should_exit_trailing = False
             stop_price = None
+            trailing_message = None
             
             if position_open and self.use_trailing_stop:
-                should_exit_trailing, stop_price = trailing_stop.update(
+                should_exit_trailing, stop_price, trailing_message = trailing_stop.update(
                     current_price, current_high, current_atr
                 )
+
+                #Print the trailing stop message (if available)
+                if trailing_message:
+                    print(f"{idx}: {trailing_message}")
                 
                 # Check if low of the period hit the stop (more realistic)
                 if not should_exit_trailing and stop_price and current_low <= stop_price:
@@ -715,17 +739,20 @@ def print_interval_analysis(ticker, trading_results):
                 print(f"    {i}. {period['start'].strftime('%Y-%m-%d %H:%M')} to {period['end'].strftime('%Y-%m-%d %H:%M')}")
                 print(f"       Profit: ${period['profit']:.2f} ({period['return_pct']:+.2f}%)")
 
-def analyze_ticker_with_trailing_stop(ticker, method_name, use_trailing_stop=True, trail_percent=5.0, trail_strategy='percentage'):
+
+def analyze_ticker_with_trailing_stop(ticker, method_name, use_trailing_stop=True, 
+                                     trail_percent=5.0, trail_strategy='percentage',
+                                     interval='1h'):
     """Enhanced ticker analysis with trailing stop loss"""
     print(f"\n{'='*60}")
-    print(f"ANALYZING: {ticker}")
+    print(f"ANALYZING: {ticker} ({interval} interval)")
     if use_trailing_stop:
         print(f"Trailing Stop: {trail_percent}% ({trail_strategy})")
     else:
         print("Trailing Stop: DISABLED")
     print(f"{'='*60}")
     
-    data = download_data_robust(ticker, period='30d', interval='1h', include_premarket=True)
+    data = download_data_robust(ticker, period='30d', interval=interval, include_premarket=True)
     if data is None:
         print(f"   Failed to download data for {ticker}")
         return None
@@ -934,7 +961,7 @@ def run_trailing_stop_comparison(test_tickers):
     
     return results_with_stop, results_without_stop
 
-def test_different_trailing_stop_strategies(ticker='AAPL'):
+def test_different_trailing_stop_strategies(ticker='REPL'):
     """Test different trailing stop strategies on a single ticker"""
     print(f"\n{'='*80}")
     print(f"TESTING DIFFERENT TRAILING STOP STRATEGIES FOR {ticker}")
@@ -945,7 +972,6 @@ def test_different_trailing_stop_strategies(ticker='AAPL'):
         {'use_trailing_stop': True, 'trail_percent': 3.0, 'trail_strategy': 'percentage', 'name': '3% Percentage'},
         {'use_trailing_stop': True, 'trail_percent': 5.0, 'trail_strategy': 'percentage', 'name': '5% Percentage'},
         {'use_trailing_stop': True, 'trail_percent': 7.0, 'trail_strategy': 'percentage', 'name': '7% Percentage'},
-        {'use_trailing_stop': True, 'trail_percent': 5.0, 'trail_strategy': 'atr', 'name': '2x ATR'},
     ]
     
     results = []
@@ -992,14 +1018,63 @@ def test_different_trailing_stop_strategies(ticker='AAPL'):
     
     return results
 
+def compare_intervals_for_ticker(ticker='REPL'):
+    """Compare performance across different time intervals"""
+    print(f"\n{'='*80}")
+    print(f"TIME INTERVAL COMPARISON FOR {ticker}")
+    print(f"{'='*80}")
+    
+    intervals = ['1m', '5m', '15m', '1h', '1d']
+    results = []
+    
+    for interval in intervals:
+        print(f"\nAnalyzing {interval} interval...")
+        result = analyze_ticker_with_trailing_stop(
+            ticker, 
+            f"macd_ml_interval_{interval}", 
+            use_trailing_stop=True,
+            trail_percent=5.0,
+            trail_strategy='percentage',
+            interval=interval
+        )
+        
+        if result:
+            result['interval'] = interval
+            results.append(result)
+    
+    # Create comparison table
+    print(f"\n{'='*100}")
+    print(f"INTERVAL PERFORMANCE COMPARISON FOR {ticker}")
+    print(f"{'='*100}")
+    
+    if results:
+        print(f"{'Interval':<8}{'Model':<6}{'Return%':<10}{'Win Rate':<10}{'Trades':<8}{'TS Exits':<9}{'Alpha':<8}")
+        print("-" * 100)
+        
+        for result in results:
+            for model_type in ['rf', 'svm']:
+                trading = result[f'{model_type}_trading']
+                model_name = 'RF' if model_type == 'rf' else 'SVM'
+                
+                return_pct = trading['return_percentage']
+                win_rate = trading['win_rate']
+                total_trades = trading['total_trades']
+                ts_exits = trading.get('trailing_stop_exits', 0)
+                alpha = trading['alpha']
+                
+                print(f"{result['interval']:<8}{model_name:<6}{return_pct:>6.2f}%{'':<3}"
+                      f"{win_rate:>6.1%}{'':<3}{total_trades:>5}{'':<2}{ts_exits:>6}{'':<2}{alpha:>+6.2f}%")
+            print()
+    
+    return results
+
 def main():
-    """Enhanced main function with trailing stop analysis"""
+    """Enhanced main function with trailing stop and interval analysis"""
     print("Starting enhanced MACD prediction analysis with trailing stop loss...")
-    print(f"Analyzing with multiple trailing stop strategies")
-    print("Tracking profits across Daily, Weekly, Monthly, and Quarterly intervals\n")
+    print(f"Analyzing with multiple trailing stop strategies and time intervals\n")
     
     # Test with a smaller subset first
-    test_tickers = ['AAPL', 'MSFT', 'GOOGL']  # Start with just a few for testing
+    test_tickers = ['REPL']  # Example tickers
     
     # Run comprehensive comparison
     results_with_stop, results_without_stop = run_trailing_stop_comparison(test_tickers)
@@ -1008,46 +1083,17 @@ def main():
     print("\n" + "=" * 100)
     print("DETAILED STRATEGY TESTING")
     print("=" * 100)
-    strategy_results = test_different_trailing_stop_strategies('AAPL')
+    strategy_results = test_different_trailing_stop_strategies('REPL')
+    
+    # Test different intervals on a single ticker
+    print("\n" + "=" * 100)
+    print("TIME INTERVAL COMPARISON")
+    print("=" * 100)
+    interval_results = compare_intervals_for_ticker('REPL')
     
     print("\n" + "=" * 60)
     print("ANALYSIS COMPLETE")
     print("=" * 60)
-    print("Key Features Added:")
-    print("  ✓ Trailing stop loss (percentage, fixed, ATR-based)")
-    print("  ✓ Multiple exit strategies (prediction vs trailing stop)")
-    print("  ✓ Enhanced risk management")
-    print("  ✓ Comprehensive performance comparison")
-    print("  ✓ Strategy optimization testing")
-    print("  ✓ Time interval profit tracking")
-    print("  ✓ Detailed exit reason analysis")
-    
-    # Summary insights
-    if results_with_stop and results_without_stop:
-        print("\nSUMMARY INSIGHTS:")
-        total_improvement = 0
-        better_count = 0
-        
-        for ticker in ['AAPL', 'MSFT', 'GOOGL']:
-            with_stop = next((r for r in results_with_stop if r['ticker'] == ticker), None)
-            without_stop = next((r for r in results_without_stop if r['ticker'] == ticker), None)
-            
-            if with_stop and without_stop:
-                # Compare better performing models
-                better_model = with_stop['better_model']
-                return_with = with_stop[f'{better_model}_trading']['return_percentage']
-                return_without = without_stop[f'{better_model}_trading']['return_percentage']
-                improvement = return_with - return_without
-                
-                total_improvement += improvement
-                if improvement > 0:
-                    better_count += 1
-                
-                print(f"  {ticker}: {improvement:+.2f}% improvement with trailing stop")
-        
-        avg_improvement = total_improvement / len(['AAPL', 'MSFT', 'GOOGL'])
-        print(f"\nAverage improvement with trailing stop: {avg_improvement:+.2f}%")
-        print(f"Stocks improved: {better_count}/3")
 
 if __name__ == "__main__":
     print("MACD Trading Analysis with Trailing Stop Loss")
